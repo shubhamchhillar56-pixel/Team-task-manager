@@ -1,0 +1,159 @@
+name: tasking-manager-main
+
+volumes:
+  tm_db_data:
+    name: tm-db-data-main
+
+networks:
+  tm-net:
+    name: tm-net
+
+services:
+  tm-db:
+    image: "postgis/postgis:${POSTGIS_TAG:-14-3.3}"
+    volumes:
+      - tm_db_data:/var/lib/postgresql/data/
+    env_file:
+      - tasking-manager.env
+    restart: unless-stopped
+    healthcheck:
+      test: pg_isready -U ${POSTGRES_USER:-tm} -d ${POSTGRES_DB:-test_db}
+      start_period: 35s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "traefik.enable=false"
+    networks:
+      - tm-net
+
+  tm-backend:
+    image: ghcr.io/hotosm/tasking-manager/backend:main
+    build:
+      context: .
+      target: ${TARGET_TAG:-debug}
+      dockerfile: ./scripts/docker/Dockerfile
+    depends_on:
+      tm-db:
+        condition: service_healthy
+      tm-migration:
+        condition: service_completed_successfully
+    env_file:
+      - tasking-manager.env
+    volumes:
+      - ./pyproject.toml:/usr/src/app/pyproject.toml
+      - ./uv.lock:/usr/src/app/uv.lock
+      - ./backend:/usr/src/app/backend
+      - ./tests:/usr/src/app/tests
+      - ./migrations:/usr/src/app/migrations/
+    ports:
+      - 5678:5678 #DebugPy
+    restart: unless-stopped
+    healthcheck:
+      test: curl --fail http://localhost:5000/api/docs
+      interval: 10s
+      retries: 5
+      start_period: 10s
+      timeout: 3s
+    deploy:
+      replicas: ${API_REPLICAS:-1}
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1500M
+        reservations:
+          cpus: "1"
+          memory: 100M
+    labels:
+      - traefik.http.routers.backend.rule=(Host(`127.0.0.1`) || Host(`localhost`)) && PathPrefix(`/api/`)
+      - traefik.http.services.backend.loadbalancer.server.port=5000
+    networks:
+      - tm-net
+
+  tm-migration:
+    image: ghcr.io/hotosm/tasking-manager/backend:main
+    build:
+      context: .
+      target: ${TARGET_TAG:-debug}
+      dockerfile: ./scripts/docker/Dockerfile
+    entrypoint: ["alembic", "-c", "migrations/alembic.ini", "upgrade", "head"]
+    depends_on:
+      tm-db:
+        condition: service_healthy
+    env_file:
+      - tasking-manager.env
+    volumes:
+      - ./pyproject.toml:/usr/src/app/pyproject.toml
+      - ./uv.lock:/usr/src/app/uv.lock
+      - ./backend:/usr/src/app/backend
+      - ./tests:/usr/src/app/tests
+      - ./migrations:/usr/src/app/migrations/
+    deploy:
+      replicas: ${API_REPLICAS:-1}
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1500M
+        reservations:
+          cpus: "1"
+          memory: 100M
+    networks:
+      - tm-net
+
+  tm-cron-jobs:
+    image: ghcr.io/hotosm/tasking-manager/backend:main
+    build:
+      context: .
+      target: ${TARGET_TAG:-debug}
+      dockerfile: ./scripts/docker/Dockerfile
+    command: ["python", "backend/cron_jobs.py"]
+    depends_on:
+      tm-db:
+        condition: service_healthy
+    env_file:
+      - tasking-manager.env
+    environment:
+      - PYTHONPATH=/usr/src/app
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.2"
+          memory: 128M
+    networks:
+      - tm-net
+
+  tm-frontend:
+    # NOTE: For Frontend development with docker-compose
+    # - Uncomment volume section below to enable live reload of frontend code
+    # - Add `TARGET_TAG=debug` to your `tasking-manager.env` or new `.env` file
+    image: ghcr.io/hotosm/tasking-manager/frontend:main
+    build:
+      context: .
+      dockerfile: "./scripts/docker/Dockerfile.frontend"
+      target: ${TARGET_TAG:-prod}
+    env_file:
+      - tasking-manager.env
+    labels:
+      - traefik.http.routers.frontend.rule=Host(`127.0.0.1`) || Host(`localhost`)
+      - traefik.http.services.frontend.loadbalancer.server.port=3000
+    # volumes:
+    #   - ./frontend:/usr/src/app
+    networks:
+      - tm-net
+
+  traefik:
+    image: traefik:v3.6.1
+    restart: always
+    ports:
+      - "${TM_DEV_PORT:-3000}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - --entrypoints.web.address=:80
+      - --providers.docker=true
+    networks:
+      - tm-net
